@@ -5,6 +5,8 @@
 //!   agent --continue      resume the last session
 //!   agent --plan          start in read-only plan mode
 //!   agent -m <model>      pick a model
+//!   agent --gui           open a browser window instead of the terminal UI
+//!   agent --gui --port N  choose the local port (default 7878)
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -12,7 +14,12 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::{env, fs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use std::{env, fs, thread};
+
+const GUI_HTML: &str = include_str!("../ui/index.html");
 
 const MAX_STEPS: usize = 30;
 const IGNORE: [&str; 7] = [".git", "target", "node_modules", ".venv", "venv", "__pycache__", ".agent"];
@@ -71,11 +78,51 @@ struct Agent {
     messages: Vec<Value>,
     allowed: HashSet<String>,
     http: reqwest::blocking::Client,
+    ui: Ui,
+}
+
+/// Events shared between the agent thread and the local web server.
+struct Shared {
+    events: Mutex<Vec<Value>>,
+    busy: AtomicBool,
+}
+
+enum Ui {
+    Cli,
+    Gui { shared: Arc<Shared>, answers: mpsc::Receiver<String> },
 }
 
 impl Agent {
     fn mode_name(&self) -> &'static str {
         if self.plan_mode { "plan" } else { "build" }
+    }
+
+    // ---------------------------------------------------------- output
+    /// All user-visible output goes through here so it works in both the terminal and the GUI.
+    fn emit(&self, kind: &str, text: &str) {
+        match &self.ui {
+            Ui::Cli => match kind {
+                "assistant" => println!("\n{text}"),
+                "tool" => println!("\n> {text}"),
+                "cmd" => println!("  $ {text}"),
+                "error" => println!("\nError: {text}"),
+                _ => println!("{text}"),
+            },
+            Ui::Gui { shared, .. } => {
+                shared.events.lock().unwrap().push(json!({"kind": kind, "text": text}));
+            }
+        }
+    }
+
+    fn emit_status(&self) {
+        if let Ui::Gui { shared, .. } = &self.ui {
+            shared.events.lock().unwrap().push(json!({
+                "kind": "status",
+                "mode": self.mode_name(),
+                "model": self.model,
+                "root": self.root.display().to_string(),
+            }));
+        }
     }
 
     // ---------------------------------------------------------- helpers
@@ -127,6 +174,19 @@ impl Agent {
         if self.allowed.contains(name) {
             return true;
         }
+        if let Ui::Gui { answers, .. } = &self.ui {
+            while answers.try_recv().is_ok() {} // drop stale answers
+            self.emit("confirm", name);
+            let a = answers.recv_timeout(Duration::from_secs(900)).unwrap_or_default();
+            return match a.trim().chars().next() {
+                Some('a') => {
+                    self.allowed.insert(name.to_string());
+                    true
+                }
+                Some('y') => true,
+                _ => false,
+            };
+        }
         print!("  allow? [y]es / [n]o / [a]lways this session: ");
         io::stdout().flush().ok();
         let mut line = String::new();
@@ -149,9 +209,9 @@ impl Agent {
             .header(&format!("a/{path}"), &format!("b/{path}"))
             .to_string();
         if diff.is_empty() {
-            println!("(no changes)");
+            self.emit("info", "(no changes)");
         } else {
-            println!("{diff}");
+            self.emit("diff", &diff);
         }
     }
 
@@ -279,7 +339,7 @@ impl Agent {
 
     fn t_bash(&mut self, v: &Value) -> Result<String> {
         let cmd = arg(v, "command")?;
-        println!("  $ {cmd}");
+        self.emit("cmd", cmd);
         if !self.confirm("bash") {
             return Ok("User denied this command.".into());
         }
@@ -334,7 +394,10 @@ impl Agent {
         });
         let resp = self
             .http
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!(
+                "{}/v1/messages",
+                env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into()).trim_end_matches('/')
+            ))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&body)
@@ -360,13 +423,13 @@ impl Agent {
                     Some("text") => {
                         let t = b["text"].as_str().unwrap_or("");
                         if !t.trim().is_empty() {
-                            println!("\n{t}");
+                            self.emit("assistant", t);
                         }
                     }
                     Some("tool_use") => {
                         let name = b["name"].as_str().unwrap_or("");
                         let id = b["id"].as_str().unwrap_or("");
-                        println!("\n> {name} {}", truncate(&b["input"].to_string(), 100));
+                        self.emit("tool", &format!("{name} {}", truncate(&b["input"].to_string(), 100)));
                         let out = self.exec(name, &b["input"]);
                         results.push(json!({"type": "tool_result", "tool_use_id": id, "content": out}));
                     }
@@ -378,7 +441,7 @@ impl Agent {
             }
             self.messages.push(json!({"role": "user", "content": results}));
         }
-        println!("\n[stopped: reached step limit]");
+        self.emit("info", "[stopped: reached step limit]");
         Ok(())
     }
 
@@ -391,18 +454,166 @@ impl Agent {
     }
 }
 
+/// Handle one line of input (a slash command or a prompt). Returns false to quit.
+fn handle_input(agent: &mut Agent, text: &str) -> bool {
+    match text {
+        "/exit" | "/quit" => return false,
+        "/help" => agent.emit("info", HELP),
+        "/mode" => {
+            agent.plan_mode = !agent.plan_mode;
+            agent.emit("info", &format!("mode: {}", agent.mode_name()));
+        }
+        "/clear" => {
+            agent.messages.clear();
+            agent.allowed.clear();
+            agent.emit("info", "new session");
+        }
+        t if t.starts_with("/model") => {
+            if let Some(m) = t.split_whitespace().nth(1) {
+                agent.model = m.to_string();
+            }
+            agent.emit("info", &format!("model: {}", agent.model));
+        }
+        _ => {
+            let mark = agent.messages.len();
+            agent.messages.push(json!({"role": "user", "content": text}));
+            if let Err(e) = agent.run_turn() {
+                agent.messages.truncate(mark); // drop the half-finished turn
+                agent.emit("error", &e.to_string());
+            }
+            agent.save();
+        }
+    }
+    agent.emit_status();
+    true
+}
+
+// ------------------------------------------------------------------ GUI
+fn make_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    (0..2).map(|_| format!("{:016x}", RandomState::new().build_hasher().finish())).collect()
+}
+
+fn open_browser(url: &str) {
+    let _ = if cfg!(windows) {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).spawn()
+    } else {
+        Command::new("xdg-open").arg(url).spawn()
+    };
+}
+
+fn header_of(req: &tiny_http::Request, name: &'static str) -> Option<String> {
+    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
+}
+
+fn reply(req: tiny_http::Request, code: u16, ctype: &str, body: String) {
+    let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
+    let _ = req.respond(tiny_http::Response::from_string(body).with_header(h).with_status_code(tiny_http::StatusCode(code)));
+}
+
+fn serve(agent: Agent, shared: Arc<Shared>, answers: mpsc::Sender<String>, port: u16, first: String) -> Result<()> {
+    let token = make_token();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+
+    // The agent lives on its own thread so the web server never blocks on the model.
+    {
+        let shared = shared.clone();
+        thread::spawn(move || {
+            let mut agent = agent;
+            agent.emit_status();
+            while let Ok(text) = cmd_rx.recv() {
+                let keep = handle_input(&mut agent, &text);
+                shared.busy.store(false, Ordering::SeqCst);
+                if !keep {
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+
+    let submit = |text: String| {
+        shared.busy.store(true, Ordering::SeqCst);
+        shared.events.lock().unwrap().push(json!({"kind": "user", "text": text}));
+        let _ = cmd_tx.send(text);
+    };
+    if !first.is_empty() {
+        submit(first);
+    }
+
+    let server = tiny_http::Server::http(("127.0.0.1", port)).map_err(|e| anyhow!("cannot listen on port {port}: {e}"))?;
+    let url = format!("http://127.0.0.1:{port}/?t={token}");
+    println!("GUI running at {url}\n(press Ctrl+C here to stop)");
+    open_browser(&url);
+
+    let hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
+    for mut req in server.incoming_requests() {
+        // Anything that can run shell commands must not be reachable from other web pages:
+        // only accept our own Host header and a secret token.
+        let host_ok = header_of(&req, "Host").map(|h| hosts.contains(&h)).unwrap_or(false);
+        let full = req.url().to_string();
+        let (path, query) = full.split_once('?').unwrap_or((full.as_str(), ""));
+        let tok_ok = header_of(&req, "X-Token").as_deref() == Some(token.as_str())
+            || query.split('&').any(|kv| kv == format!("t={token}"));
+        if !host_ok || !tok_ok {
+            reply(req, 403, "text/plain", "forbidden".into());
+            continue;
+        }
+        let method = req.method().as_str().to_string();
+        match (method.as_str(), path) {
+            ("GET", "/") => reply(req, 200, "text/html; charset=utf-8", GUI_HTML.to_string()),
+            ("GET", "/events") => {
+                let since: usize = query.split('&').find_map(|kv| kv.strip_prefix("since=")).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let ev = shared.events.lock().unwrap();
+                let from = since.min(ev.len());
+                let body = json!({"events": &ev[from..], "next": ev.len(), "busy": shared.busy.load(Ordering::SeqCst)});
+                drop(ev);
+                reply(req, 200, "application/json", body.to_string());
+            }
+            ("POST", "/send") => {
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let text = serde_json::from_str::<Value>(&body).ok().and_then(|v| v["text"].as_str().map(|t| t.trim().to_string())).unwrap_or_default();
+                if text.is_empty() {
+                    reply(req, 400, "application/json", r#"{"error":"empty"}"#.into());
+                } else if shared.busy.load(Ordering::SeqCst) {
+                    reply(req, 409, "application/json", r#"{"error":"busy"}"#.into());
+                } else {
+                    submit(text);
+                    reply(req, 200, "application/json", "{}".into());
+                }
+            }
+            ("POST", "/answer") => {
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let a = serde_json::from_str::<Value>(&body).ok().and_then(|v| v["answer"].as_str().map(String::from)).unwrap_or_default();
+                let _ = answers.send(a);
+                reply(req, 200, "application/json", "{}".into());
+            }
+            _ => reply(req, 404, "text/plain", "not found".into()),
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let mut model = env::var("MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let mut plan_mode = false;
     let mut cont = false;
+    let mut gui = false;
+    let mut port: u16 = 7878;
     let mut prompt = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--plan" => plan_mode = true,
             "-c" | "--continue" => cont = true,
+            "--gui" => gui = true,
+            "--port" => port = args.next().and_then(|p| p.parse().ok()).ok_or_else(|| anyhow!("--port needs a number"))?,
             "-m" | "--model" => model = args.next().ok_or_else(|| anyhow!("-m needs a model id"))?,
             _ => prompt.push(a),
         }
@@ -411,6 +622,10 @@ fn main() -> Result<()> {
     let api_key = env::var("ANTHROPIC_API_KEY")
         .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not set (put it in a .env file or your environment)"))?;
     let root = env::current_dir()?.canonicalize()?;
+
+    let shared = Arc::new(Shared { events: Mutex::new(Vec::new()), busy: AtomicBool::new(false) });
+    let (answer_tx, answer_rx) = mpsc::channel::<String>();
+    let ui = if gui { Ui::Gui { shared: shared.clone(), answers: answer_rx } } else { Ui::Cli };
 
     let mut agent = Agent {
         root,
@@ -422,19 +637,25 @@ fn main() -> Result<()> {
         http: reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()?,
+        ui,
     };
 
     if cont {
         if let Ok(s) = fs::read_to_string(agent.root.join(".agent/session.json")) {
             if let Ok(Value::Array(m)) = serde_json::from_str(&s) {
-                println!("Resumed {} messages.", m.len());
+                let n = m.len();
                 agent.messages = m;
+                agent.emit("info", &format!("Resumed {n} messages."));
             }
         }
     }
 
-    println!("agent  {}\nmodel: {}   mode: {}   (/help)", agent.root.display(), agent.model, agent.mode_name());
+    agent.emit("info", &format!("agent  {}\nmodel: {}   mode: {}   (/help)", agent.root.display(), agent.model, agent.mode_name()));
     let mut queued = prompt.join(" ");
+
+    if gui {
+        return serve(agent, shared, answer_tx, port, queued);
+    }
 
     loop {
         let text = if !queued.is_empty() {
@@ -451,33 +672,8 @@ fn main() -> Result<()> {
         if text.is_empty() {
             continue;
         }
-        match text.as_str() {
-            "/exit" | "/quit" => break,
-            "/help" => println!("{HELP}"),
-            "/mode" => {
-                agent.plan_mode = !agent.plan_mode;
-                println!("mode: {}", agent.mode_name());
-            }
-            "/clear" => {
-                agent.messages.clear();
-                agent.allowed.clear();
-                println!("new session");
-            }
-            t if t.starts_with("/model") => {
-                if let Some(m) = t.split_whitespace().nth(1) {
-                    agent.model = m.to_string();
-                }
-                println!("model: {}", agent.model);
-            }
-            _ => {
-                let mark = agent.messages.len();
-                agent.messages.push(json!({"role": "user", "content": text}));
-                if let Err(e) = agent.run_turn() {
-                    agent.messages.truncate(mark); // drop the half-finished turn
-                    println!("\nError: {e}");
-                }
-                agent.save();
-            }
+        if !handle_input(&mut agent, &text) {
+            break;
         }
     }
     Ok(())

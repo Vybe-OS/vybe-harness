@@ -12,6 +12,7 @@ walkdir = "2"
 globset = "0.4"
 similar = "2"
 dotenvy = "0.15"
+tiny_http = "0.12"
 
 [profile.release]
 opt-level = 3
